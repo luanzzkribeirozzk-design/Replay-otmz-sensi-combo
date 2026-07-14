@@ -1,8 +1,6 @@
 package com.devwilltech.otimizacao.ui.screens
 
 import android.annotation.SuppressLint
-import android.webkit.WebResourceRequest
-import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.compose.foundation.background
@@ -17,14 +15,13 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
-import androidx.webkit.WebViewAssetLoader
 import com.devwilltech.otimizacao.MainViewModel
 import com.devwilltech.otimizacao.ui.theme.NeonYellow
 
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun SensiScreen(viewModel: MainViewModel) {
-    val context = LocalContext.current
+    val context   = LocalContext.current
     var isLoading by remember { mutableStateOf(true) }
 
     Box(
@@ -34,61 +31,62 @@ fun SensiScreen(viewModel: MainViewModel) {
     ) {
         AndroidView(
             modifier = Modifier.fillMaxSize(),
-            factory = { ctx ->
-
-                // ⚡ FIX: WebViewAssetLoader serve os assets via
-                // https://appassets.androidplatform.net → crypto.subtle funciona.
-                // Carregando como file:// bloqueava a Web Crypto API no Android.
-                val assetLoader = WebViewAssetLoader.Builder()
-                    .setDomain("appassets.androidplatform.net")
-                    .addPathHandler(
-                        "/assets/",
-                        WebViewAssetLoader.AssetsPathHandler(ctx)
-                    )
-                    .build()
-
+            factory  = { ctx ->
                 WebView(ctx).apply {
                     with(settings) {
-                        javaScriptEnabled              = true
-                        domStorageEnabled              = true
-                        allowFileAccess                = false
-                        allowContentAccess             = false
+                        javaScriptEnabled        = true
+                        domStorageEnabled        = true
+                        allowFileAccess          = false
+                        allowContentAccess       = false
+                        // Desabilita acesso cross-origin desnecessário
                         @Suppress("DEPRECATION")
                         allowFileAccessFromFileURLs    = false
                         @Suppress("DEPRECATION")
                         allowUniversalAccessFromFileURLs = false
-                        // Garante que o WebView use a versão mais moderna disponível
-                        mediaPlaybackRequiresUserGesture = false
                     }
 
                     webViewClient = object : WebViewClient() {
-                        override fun shouldInterceptRequest(
-                            view: WebView,
-                            request: WebResourceRequest
-                        ): WebResourceResponse? {
-                            // Redireciona requisições para os assets locais
-                            return assetLoader.shouldInterceptRequest(request.url)
-                        }
-
                         override fun onPageFinished(view: WebView?, url: String?) {
                             super.onPageFinished(view, url)
                             isLoading = false
                         }
                     }
 
-                    // Carrega via HTTPS sintético — habilita crypto.subtle
-                    loadUrl("https://appassets.androidplatform.net/assets/sensi.html")
+                    // ⚡ FIX: carrega o HTML dos assets com base URL HTTPS.
+                    // loadUrl("file://...") bloqueava crypto.subtle no Android.
+                    // loadDataWithBaseURL com "https://localhost/" cria contexto
+                    // seguro sem precisar da dependência androidx.webkit.
+                    try {
+                        val html = ctx.assets.open("sensi.html")
+                            .bufferedReader()
+                            .readText()
+
+                        loadDataWithBaseURL(
+                            "https://localhost/",  // base URL → habilita crypto.subtle
+                            html,
+                            "text/html",
+                            "UTF-8",
+                            null
+                        )
+                    } catch (e: Exception) {
+                        loadData(
+                            "<html><body style=\'background:#000;color:#FF453A;font-family:monospace;padding:24px\'>" +
+                            "<h3>Erro ao carregar sensi.html</h3><p>${e.message}</p></body></html>",
+                            "text/html",
+                            "UTF-8"
+                        )
+                        isLoading = false
+                    }
                 }
             }
         )
 
-        // Spinner enquanto a página carrega / descriptografa
         if (isLoading) {
             CircularProgressIndicator(
-                modifier = Modifier
+                modifier    = Modifier
                     .align(Alignment.Center)
                     .padding(16.dp),
-                color = NeonYellow,
+                color       = NeonYellow,
                 strokeWidth = 3.dp
             )
         }
