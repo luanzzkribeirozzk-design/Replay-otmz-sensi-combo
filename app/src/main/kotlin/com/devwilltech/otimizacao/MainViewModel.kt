@@ -20,27 +20,17 @@ import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 
+// ─── Firebase Realtime Database ───────────────────────────────────────────────
+// Estrutura esperada em /keys/<CHAVE>:
+// {
+//   "active":    true,
+//   "validity":  30,          // dias (0 = ilimitada)
+//   "firstUsed": "",          // preenchido automaticamente na 1ª ativação
+//   "deviceId":  ""           // opcional
+// }
 // ─────────────────────────────────────────────────────────────────────────────
-// ⚠️  Substitua pela URL do seu Firebase Realtime Database
-//     Formato: https://SEU-PROJETO-default-rtdb.firebaseio.com
-//
-//     A estrutura esperada no banco:
-//     {
-//       "keys": {
-//         "SUACHAVE123": {
-//           "firstUsed": "1700000000000",   ← timestamp ms quando usou pela 1ª vez
-//           "validity": 30,                 ← dias de validade (0 = ilimitado)
-//           "deviceId": "abc123",           ← opcional
-//           "active": true                  ← false = key bloqueada
-//         }
-//       }
-//     }
-// ─────────────────────────────────────────────────────────────────────────────
-private const val FIREBASE_URL = "https://SEU-PROJETO-default-rtdb.firebaseio.com"
-
-// Se o banco exigir autenticação (rules: auth != null), gere um token de serviço
-// e cole aqui. Se as rules estiverem abertas para leitura, deixe vazio.
-private const val FIREBASE_AUTH_TOKEN = ""
+private const val FIREBASE_URL  = "https://principal-6bf6f-default-rtdb.firebaseio.com"
+private const val FIREBASE_API_KEY = "AIzaSyAmXzPrNaK_-Zr190oB8MuxA_sqI_ctetc"
 
 enum class ShizukuStatus {
     CHECKING, NOT_INSTALLED, NOT_RUNNING, PERMISSION_NEEDED, READY
@@ -49,7 +39,7 @@ enum class ShizukuStatus {
 data class KeyData(
     val id: String,
     val firstUsed: String? = null,
-    val validity: Int      = 0,       // 0 = ilimitada
+    val validity: Int      = 0,
     val deviceId: String?  = null,
     val active: Boolean    = true
 )
@@ -116,108 +106,93 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     // ─── FIREBASE KEY VALIDATION ───────────────────────────────────────────────
 
-    /**
-     * Busca a key no Firebase Realtime Database via REST.
-     *
-     * [recordFirstUsed] = true → se firstUsed estiver vazio no banco,
-     *   grava o timestamp atual (primeira ativação).
-     */
     private fun fetchKeyData(key: String, recordFirstUsed: Boolean) {
         viewModelScope.launch(Dispatchers.IO) {
             withContext(Dispatchers.Main) {
                 _uiState.update { it.copy(isFetchingKey = true) }
             }
             try {
-                // ── 1. Buscar dados da key ──────────────────────────────────
-                val authParam = if (FIREBASE_AUTH_TOKEN.isNotEmpty())
-                    "?auth=$FIREBASE_AUTH_TOKEN" else ".json"
-                val endpoint  = if (FIREBASE_AUTH_TOKEN.isNotEmpty())
-                    "$FIREBASE_URL/keys/$key.json?auth=$FIREBASE_AUTH_TOKEN"
-                else
-                    "$FIREBASE_URL/keys/$key.json"
-
-                val url  = URL(endpoint)
-                val conn = (url.openConnection() as HttpURLConnection).also {
-                    it.requestMethod  = "GET"
-                    it.connectTimeout = 6000
-                    it.readTimeout    = 6000
-                    it.setRequestProperty("Accept", "application/json")
+                // GET /keys/<KEY>.json?auth=<API_KEY>
+                val endpoint = "$FIREBASE_URL/keys/$key.json?key=$FIREBASE_API_KEY"
+                val conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+                    requestMethod  = "GET"
+                    connectTimeout = 7000
+                    readTimeout    = 7000
+                    setRequestProperty("Accept", "application/json")
                 }
 
                 val code = conn.responseCode
-                if (code != 200) {
-                    val msg = when (code) {
-                        401, 403 -> "Sem permissão no banco"
-                        404      -> "Key não encontrada"
-                        else     -> "Erro de conexão ($code)"
-                    }
-                    withContext(Dispatchers.Main) {
-                        _uiState.update {
-                            it.copy(
-                                isLoggingIn  = false,
-                                isFetchingKey = false,
-                                loginError   = msg
-                            )
-                        }
-                    }
-                    conn.disconnect()
-                    return@launch
+                val body = try {
+                    conn.inputStream.bufferedReader().readText()
+                } catch (e: Exception) {
+                    conn.errorStream?.bufferedReader()?.readText() ?: ""
                 }
-
-                val body = conn.inputStream.bufferedReader().readText()
                 conn.disconnect()
 
-                // Firebase retorna "null" (string) quando a key não existe
-                if (body.trim() == "null") {
-                    withContext(Dispatchers.Main) {
-                        _uiState.update {
-                            it.copy(
-                                isLoggingIn   = false,
-                                isFetchingKey = false,
-                                loginError    = "Key inválida ou não encontrada"
-                            )
+                when {
+                    // ── Key não existe no banco ──────────────────────────────
+                    body.trim() == "null" || code == 404 -> {
+                        withContext(Dispatchers.Main) {
+                            _uiState.update {
+                                it.copy(
+                                    isLoggingIn   = false,
+                                    isFetchingKey = false,
+                                    loginError    = "❌ Key inválida ou não encontrada."
+                                )
+                            }
                         }
+                        return@launch
                     }
-                    return@launch
+
+                    // ── Erro de conexão / servidor ───────────────────────────
+                    code !in 200..299 -> {
+                        withContext(Dispatchers.Main) {
+                            _uiState.update {
+                                it.copy(
+                                    isLoggingIn   = false,
+                                    isFetchingKey = false,
+                                    loginError    = "Erro de conexão ($code). Tente novamente."
+                                )
+                            }
+                        }
+                        return@launch
+                    }
                 }
 
-                val json = JSONObject(body)
-
-                // ── 2. Verificar se está ativa ──────────────────────────────
+                val json   = JSONObject(body)
                 val active = json.optBoolean("active", true)
+
+                // ── Key bloqueada ────────────────────────────────────────────
                 if (!active) {
                     withContext(Dispatchers.Main) {
                         _uiState.update {
                             it.copy(
                                 isLoggingIn   = false,
                                 isFetchingKey = false,
-                                loginError    = "Key bloqueada. Contate o suporte."
+                                loginError    = "🔒 Key bloqueada. Contate o suporte."
                             )
                         }
                     }
                     return@launch
                 }
 
-                // ── 3. Gravar firstUsed se for primeira ativação ────────────
-                var firstUsedVal = json.optString("firstUsed").takeIf { it.isNotBlank() }
-
-                if (firstUsedVal == null && recordFirstUsed) {
-                    firstUsedVal = System.currentTimeMillis().toString()
-                    // PATCH: grava firstUsed no banco
-                    patchFirebase(key, "firstUsed", firstUsedVal)
+                // ── Primeira ativação: grava firstUsed no banco ──────────────
+                var firstUsed = json.optString("firstUsed").takeIf { it.isNotBlank() }
+                if (firstUsed == null && recordFirstUsed) {
+                    firstUsed = System.currentTimeMillis().toString()
+                    patchFirebase(key, "firstUsed", firstUsed)
                 }
 
                 val keyData = KeyData(
                     id        = key,
-                    firstUsed = firstUsedVal,
+                    firstUsed = firstUsed,
                     validity  = json.optInt("validity", 30),
                     deviceId  = json.optString("deviceId").takeIf { it.isNotBlank() },
                     active    = true
                 )
 
-                // ── 4. Salvar key localmente e atualizar estado ─────────────
+                prefs.savedKey = key
                 withContext(Dispatchers.Main) {
-                    prefs.savedKey = key
                     _uiState.update {
                         it.copy(
                             isLoggedIn    = true,
@@ -231,15 +206,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
 
             } catch (e: Exception) {
+                // Sem internet — mantém login se já tinha key salva localmente
                 withContext(Dispatchers.Main) {
                     _uiState.update {
                         it.copy(
                             isLoggingIn   = false,
                             isFetchingKey = false,
-                            // Sem internet: mantém login se já tinha key salva
                             isLoggedIn    = prefs.savedKey.isNotEmpty(),
                             loginError    = if (prefs.savedKey.isEmpty())
-                                "Sem conexão. Verifique a internet." else null
+                                "📵 Sem conexão. Verifique a internet." else null
                         )
                     }
                 }
@@ -247,27 +222,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /** Atualiza um campo no Firebase via PATCH REST */
+    /** Atualiza um campo pontual no Firebase via PATCH */
     private fun patchFirebase(key: String, field: String, value: String) {
         try {
-            val endpoint = if (FIREBASE_AUTH_TOKEN.isNotEmpty())
-                "$FIREBASE_URL/keys/$key.json?auth=$FIREBASE_AUTH_TOKEN"
-            else
-                "$FIREBASE_URL/keys/$key.json"
-
-            val url  = URL(endpoint)
-            val conn = (url.openConnection() as HttpURLConnection).also {
-                it.requestMethod     = "PATCH"
-                it.doOutput          = true
-                it.connectTimeout    = 5000
-                it.readTimeout       = 5000
-                it.setRequestProperty("Content-Type", "application/json")
+            val url  = "$FIREBASE_URL/keys/$key.json?key=$FIREBASE_API_KEY"
+            val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                requestMethod  = "PATCH"
+                doOutput       = true
+                connectTimeout = 5000
+                readTimeout    = 5000
+                setRequestProperty("Content-Type", "application/json")
             }
-            val body = """{"$field":"$value"}"""
-            conn.outputStream.use { it.write(body.toByteArray()) }
-            conn.responseCode // dispara a requisição
+            conn.outputStream.use { it.write("""{"$field":"$value"}""".toByteArray()) }
+            conn.responseCode
             conn.disconnect()
-        } catch (_: Exception) { /* silencioso */ }
+        } catch (_: Exception) {}
     }
 
     // ─── UI ───────────────────────────────────────────────────────────────────
@@ -321,10 +290,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         processingProgress  = (index + 1).toFloat() / commands.size
                     )
                 }
-                // ⚡ Timeout por comando — impede travamento em 88%
-                withTimeoutOrNull(3_000L) {
-                    ShizukuManager.execute(cmd.command)
-                }
+                withTimeoutOrNull(3_000L) { ShizukuManager.execute(cmd.command) }
                 delay(10)
             }
             _uiState.update { it.copy(isRunning = false, showReport = true) }
